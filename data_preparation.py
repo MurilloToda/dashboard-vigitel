@@ -2,73 +2,87 @@
 import pandas as pd
 import numpy as np
 
-def to_numeric_silent(series):
-    return pd.to_numeric(series, errors='coerce')
+# Colunas realmente usadas no app (atividade física + demografia + pesos)
+COLS = [
+    "ano","cidade_nome","pesorake","q6","q8_anos","q7",  # demografia
+    "ativo_lazer_unif","atitrans","atiocu","atidom","inativo",
+    "af3dominios","af3dominios_insu",
+    # Nutrição/IMC/álcool/morbidades (para as outras páginas)
+    "q9","q11","q37","q38","q75","q76","excpeso","obesid"
+]
+
+def _to_num(s): return pd.to_numeric(s, errors="coerce")
 
 def prepare_data(parquet_path: str) -> pd.DataFrame:
+    # Lê só as colunas necessárias
     try:
-        df = pd.read_parquet(parquet_path)
+        df = pd.read_parquet(parquet_path, columns=COLS, engine="pyarrow")
     except Exception as e:
-        print(f"Erro ao ler o arquivo Parquet: {e}")
+        print(f"Erro ao ler Parquet: {e}")
         return pd.DataFrame()
 
-    # Demografia básica
-    df['q6'] = to_numeric_silent(df.get('q6'))           # Idade
-    df['q8_anos'] = to_numeric_silent(df.get('q8_anos')) # Escolaridade (anos)
-    df['q7'] = to_numeric_silent(df.get('q7'))           # Sexo
-    df['ano'] = to_numeric_silent(df.get('ano'))
-    if 'cidade_nome' in df.columns:
-        df['cidade_nome'] = df['cidade_nome'].astype('string')
+    # ---------- Downcast forte ----------
+    # numéricos pequenos
+    for c in ["ano","q6","q7"]:
+        if c in df.columns:
+            df[c] = _to_num(df[c]).astype("Int16")
 
-    # Faixas
-    age_bins = [17, 24, 34, 44, 54, 64, np.inf]
-    age_labels = ['18-24 anos','25-34 anos','35-44 anos','45-54 anos','55-64 anos','65+ anos']
-    df['faixa_etaria'] = pd.cut(df['q6'], bins=age_bins, labels=age_labels, right=True)
+    if "q8_anos" in df.columns:
+        df["q8_anos"] = _to_num(df["q8_anos"]).astype("Int16")
 
-    edu_bins = [-1, 8, 11, np.inf]
-    edu_labels = ['0-8 anos','9-11 anos','12+ anos']
-    df['faixa_escolaridade'] = pd.cut(df['q8_anos'], bins=edu_bins, labels=edu_labels, right=True)
+    if "pesorake" in df.columns:
+        df["pesorake"] = _to_num(df["pesorake"]).astype("float32")
 
+    # indicadores binários -> Int8
+    for c in ["ativo_lazer_unif","atitrans","atiocu","atidom","inativo",
+              "af3dominios","af3dominios_insu","excpeso","obesid"]:
+        if c in df.columns:
+            df[c] = _to_num(df[c]).astype("Int8")
+
+    # medidas p/ IMC e álcool/morbidades
+    for c in ["q9","q11","q37","q38","q75","q76"]:
+        if c in df.columns:
+            df[c] = _to_num(df[c]).astype("float32")
+
+    # ---------- Derivações leves e categorizações ----------
     # Sexo
-    sexo_map = {1: 'Masculino', 2: 'Feminino'}
-    df['sexo'] = df['q7'].map(sexo_map)
+    if "q7" in df.columns:
+        sexo_map = {1: "Masculino", 2: "Feminino"}
+        df["sexo"] = df["q7"].map(sexo_map).astype("category")
+    else:
+        df["sexo"] = pd.Categorical([])
 
-    # IMC / Excesso de peso / Obesidade (valores extremos tratados)
-    peso = to_numeric_silent(df.get('q9'))
-    alt_cm = to_numeric_silent(df.get('q11'))
-    imc = peso / ((alt_cm / 100) ** 2)
-    imc[(alt_cm >= 700) | (peso >= 700)] = np.nan  # sentinelas conforme dicionário
-    imc[(imc < 10) | (imc > 100)] = np.nan
-    df['imc'] = imc
-    df['excpeso'] = np.where(df['imc'] >= 25, 1, 0)
-    df['obesid']  = np.where(df['imc'] >= 30, 1, 0)
+    # Faixa etária
+    if "q6" in df.columns:
+        age_bins = [17, 24, 34, 44, 54, 64, np.inf]
+        age_labels = ['18-24 anos','25-34 anos','35-44 anos','45-54 anos','55-64 anos','65+ anos']
+        df["faixa_etaria"] = pd.cut(df["q6"].astype("float32"), bins=age_bins,
+                                    labels=age_labels, right=True).astype("category")
+    else:
+        df["faixa_etaria"] = pd.Categorical([])
 
-    # Álcool abusivo (q37 homem; q38 mulher)
-    cond_h = (df['sexo'] == 'Masculino') & (to_numeric_silent(df.get('q37')) == 1)
-    cond_m = (df['sexo'] == 'Feminino') & (to_numeric_silent(df.get('q38')) == 1)
-    df['abuso_alcool'] = np.where(cond_h | cond_m, 1, 0)
+    # Escolaridade
+    if "q8_anos" in df.columns:
+        edu_bins = [-1, 8, 11, np.inf]
+        edu_labels = ['0-8 anos','9-11 anos','12+ anos']
+        df["faixa_escolaridade"] = pd.cut(df["q8_anos"].astype("float32"),
+                                          bins=edu_bins, labels=edu_labels,
+                                          right=True).astype("category")
+    else:
+        df["faixa_escolaridade"] = pd.Categorical([])
 
-    # Morbidades autorreferidas
-    df['hipertensao'] = np.where(to_numeric_silent(df.get('q75')) == 1, 1, 0)
-    df['diabetes']    = np.where(to_numeric_silent(df.get('q76')) == 1, 1, 0)  # << q76
+    # Cidades como categoria
+    if "cidade_nome" in df.columns:
+        df["cidade_nome"] = df["cidade_nome"].astype("string").astype("category")
 
-    # Garante indicadores (se faltarem, cria como NaN)
-    indicator_cols = [
-        'ativo_lazer_unif','atitrans','atiocu','atidom','inativo',
-        'af3dominios','af3dominios_insu','excpeso','obesid',
-        'abuso_alcool','hipertensao','diabetes'
-    ]
-    for col in indicator_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-        else:
-            df[col] = to_numeric_silent(df[col])
+    # Mantém só o essencial para o app (remove colunas cruas grandes)
+    keep = ["ano","cidade_nome","pesorake","sexo","faixa_etaria","faixa_escolaridade",
+            "ativo_lazer_unif","atitrans","atiocu","atidom","inativo",
+            "af3dominios","af3dominios_insu","excpeso","obesid"]
+    exist = [c for c in keep if c in df.columns]
+    df = df[exist].copy()
 
-    # Essenciais para o app
-    must = ['ano','cidade_nome','sexo','faixa_etaria','faixa_escolaridade','pesorake']
-    for c in must:
-        if c not in df.columns:
-            df[c] = np.nan
-    df.dropna(subset=must, inplace=True)
+    # Garante ordenação e índices compactos
+    df.sort_values(["ano","cidade_nome"], inplace=True, ignore_index=True)
 
     return df
