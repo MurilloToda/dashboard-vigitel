@@ -1,1 +1,7 @@
-pandas numpy pyarrow dash dash-bootstrap-components plotly gunicorn
+pandas 
+numpy 
+pyarrow 
+dash 
+dash-bootstrap-components 
+plotly 
+gunicorn
