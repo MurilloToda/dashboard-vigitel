@@ -1,88 +1,125 @@
 # data_preparation.py
-import pandas as pd
-import numpy as np
+# ============================================================
+# Carrega o CUBO AGREGADO do Vigitel (preferir WIDE .parquet)
+# e aplica redução agressiva de memória (downcast + category).
+# ------------------------------------------------------------
+# Saídas exportadas para o app:
+#   - df_cubo: DataFrame leve (parquet/csv wide ou derivado do long)
+#   - META: metadados (listas de dimensões e indicadores)
+# ============================================================
 
-# Colunas realmente usadas no app (atividade física + demografia + pesos)
-COLS = [
-    "ano","cidade_nome","pesorake","q6","q8_anos","q7",  # demografia
-    "ativo_lazer_unif","atitrans","atiocu","atidom","inativo",
-    "af3dominios","af3dominios_insu",
-    # Nutrição/IMC/álcool/morbidades (para as outras páginas)
-    "q9","q11","q37","q38","q75","q76","excpeso","obesid"
+from __future__ import annotations
+from pathlib import Path
+import unicodedata
+import numpy as np
+import pandas as pd
+
+# Onde ficam os arquivos do cubo
+CUBO_DIR = Path("outputs/bi")
+
+# Ordem preferida de leitura (mais leve -> mais pesado)
+WIDE_FIRST = [
+    CUBO_DIR / "cubo_vigitel_wide.parquet",
+    CUBO_DIR / "cubo_vigitel_wide.csv",
+]
+LONG_FALLBACK = [
+    CUBO_DIR / "cubo_vigitel_long.parquet",
+    CUBO_DIR / "cubo_vigitel_long.csv",
 ]
 
-def _to_num(s): return pd.to_numeric(s, errors="coerce")
+# Dimensões padrão
+DIM_COLS = ["ano", "cidade_nome", "sexo", "faixa_etaria", "faixa_escolaridade"]
 
-def prepare_data(parquet_path: str) -> pd.DataFrame:
-    # Lê só as colunas necessárias
-    try:
-        df = pd.read_parquet(parquet_path, columns=COLS, engine="pyarrow")
-    except Exception as e:
-        print(f"Erro ao ler Parquet: {e}")
-        return pd.DataFrame()
+# Normalização leve para nomes de cidades
+def _norm_str(s: pd.Series) -> pd.Series:
+    s = s.astype("string")
+    s = s.str.normalize("NFKD").str.encode("ascii", "ignore").str.decode("utf-8")
+    return s.str.strip().str.lower()
 
-    # ---------- Downcast forte ----------
-    # numéricos pequenos
-    for c in ["ano","q6","q7"]:
+def _to_int16(x: pd.Series) -> pd.Series:
+    return pd.to_numeric(x, errors="coerce").astype("Int16")
+
+def _downcast_dims(df: pd.DataFrame) -> pd.DataFrame:
+    if "ano" in df.columns:
+        df["ano"] = _to_int16(df["ano"])
+    for c in ("cidade_nome", "sexo", "faixa_etaria", "faixa_escolaridade"):
         if c in df.columns:
-            df[c] = _to_num(df[c]).astype("Int16")
-
-    if "q8_anos" in df.columns:
-        df["q8_anos"] = _to_num(df["q8_anos"]).astype("Int16")
-
-    if "pesorake" in df.columns:
-        df["pesorake"] = _to_num(df["pesorake"]).astype("float32")
-
-    # indicadores binários -> Int8
-    for c in ["ativo_lazer_unif","atitrans","atiocu","atidom","inativo",
-              "af3dominios","af3dominios_insu","excpeso","obesid"]:
-        if c in df.columns:
-            df[c] = _to_num(df[c]).astype("Int8")
-
-    # medidas p/ IMC e álcool/morbidades
-    for c in ["q9","q11","q37","q38","q75","q76"]:
-        if c in df.columns:
-            df[c] = _to_num(df[c]).astype("float32")
-
-    # ---------- Derivações leves e categorizações ----------
-    # Sexo
-    if "q7" in df.columns:
-        sexo_map = {1: "Masculino", 2: "Feminino"}
-        df["sexo"] = df["q7"].map(sexo_map).astype("category")
-    else:
-        df["sexo"] = pd.Categorical([])
-
-    # Faixa etária
-    if "q6" in df.columns:
-        age_bins = [17, 24, 34, 44, 54, 64, np.inf]
-        age_labels = ['18-24 anos','25-34 anos','35-44 anos','45-54 anos','55-64 anos','65+ anos']
-        df["faixa_etaria"] = pd.cut(df["q6"].astype("float32"), bins=age_bins,
-                                    labels=age_labels, right=True).astype("category")
-    else:
-        df["faixa_etaria"] = pd.Categorical([])
-
-    # Escolaridade
-    if "q8_anos" in df.columns:
-        edu_bins = [-1, 8, 11, np.inf]
-        edu_labels = ['0-8 anos','9-11 anos','12+ anos']
-        df["faixa_escolaridade"] = pd.cut(df["q8_anos"].astype("float32"),
-                                          bins=edu_bins, labels=edu_labels,
-                                          right=True).astype("category")
-    else:
-        df["faixa_escolaridade"] = pd.Categorical([])
-
-    # Cidades como categoria
-    if "cidade_nome" in df.columns:
-        df["cidade_nome"] = df["cidade_nome"].astype("string").astype("category")
-
-    # Mantém só o essencial para o app (remove colunas cruas grandes)
-    keep = ["ano","cidade_nome","pesorake","sexo","faixa_etaria","faixa_escolaridade",
-            "ativo_lazer_unif","atitrans","atiocu","atidom","inativo",
-            "af3dominios","af3dominios_insu","excpeso","obesid"]
-    exist = [c for c in keep if c in df.columns]
-    df = df[exist].copy()
-
-    # Garante ordenação e índices compactos
-    df.sort_values(["ano","cidade_nome"], inplace=True, ignore_index=True)
-
+            df[c] = _norm_str(df[c]).astype("category")
     return df
+
+def _find_file(paths) -> Path | None:
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+def _wide_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
+    # Espera colunas: DIM_COLS + ["indicador", "prevalencia"]
+    base_cols = [c for c in DIM_COLS if c in df_long.columns]
+    long_min = df_long[base_cols + ["indicador", "prevalencia"]].copy()
+    wide = (
+        long_min
+        .pivot_table(index=base_cols, columns="indicador", values="prevalencia")
+        .reset_index()
+    )
+    wide.columns = [f"prev_{c}" if c not in base_cols else c for c in wide.columns]
+    return wide
+
+def _downcast_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # Tudo que começa com "prev_" vira float32
+    for c in df.columns:
+        if c.startswith("prev_"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+    return df
+
+def load_cubo() -> tuple[pd.DataFrame, dict]:
+    # 1) tenta WIDE
+    f_wide = _find_file(WIDE_FIRST)
+    if f_wide is not None:
+        if f_wide.suffix == ".parquet":
+            df = pd.read_parquet(f_wide)
+        else:
+            df = pd.read_csv(f_wide)
+        df = _downcast_dims(df)
+        df = _downcast_indicators(df)
+
+    else:
+        # 2) fallback para LONG e deriver WIDE in-memory (ainda barato)
+        f_long = _find_file(LONG_FALLBACK)
+        if f_long is None:
+            raise FileNotFoundError(
+                "Cubo não encontrado. Gere com gerar_cubo_vigitel.py "
+                f"({WIDE_FIRST[0].as_posix()} ou {LONG_FALLBACK[0].as_posix()})"
+            )
+        if f_long.suffix == ".parquet":
+            df_long = pd.read_parquet(f_long, columns=[*DIM_COLS, "indicador", "prevalencia"])
+        else:
+            usecols = [*DIM_COLS, "indicador", "prevalencia"]
+            df_long = pd.read_csv(f_long, usecols=[c for c in usecols if c in pd.read_csv(f_long, nrows=0).columns])
+
+        df_long = _downcast_dims(df_long)
+        df = _wide_from_long(df_long)
+        df = _downcast_dims(df)
+        df = _downcast_indicators(df)
+
+    # Filtra linhas inválidas (ano/cidade vazios)
+    df = df.dropna(subset=[c for c in ("ano", "cidade_nome") if c in df.columns]).reset_index(drop=True)
+
+    # Metadados mínimos
+    indicators = [c for c in df.columns if c.startswith("prev_")]
+    indicators.sort()
+    anos = sorted([int(a) for a in df["ano"].dropna().unique()])
+    cidades = df["cidade_nome"].cat.categories.tolist() if hasattr(df["cidade_nome"], "cat") else sorted(df["cidade_nome"].dropna().unique().tolist())
+    sexos = df["sexo"].cat.categories.tolist() if ("sexo" in df and hasattr(df["sexo"], "cat")) else sorted(df.get("sexo", pd.Series(dtype="string")).dropna().unique().tolist())
+    fet = df["faixa_etaria"].cat.categories.tolist() if ("faixa_etaria" in df and hasattr(df["faixa_etaria"], "cat")) else sorted(df.get("faixa_etaria", pd.Series(dtype="string")).dropna().unique().tolist())
+    fesc = df["faixa_escolaridade"].cat.categories.tolist() if ("faixa_escolaridade" in df and hasattr(df["faixa_escolaridade"], "cat")) else sorted(df.get("faixa_escolaridade", pd.Series(dtype="string")).dropna().unique().tolist())
+
+    META = {
+        "indicators": indicators,
+        "anos": anos,
+        "cidades": cidades,
+        "sexos": sexos,
+        "faixa_etaria": fet,
+        "faixa_escolaridade": fesc,
+    }
+    return df, META

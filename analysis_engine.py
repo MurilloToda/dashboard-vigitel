@@ -1,45 +1,73 @@
 # analysis_engine.py
-import pandas as pd
+# ============================================================
+# Funções puras de análise/filtragem sobre o CUBO WIDE
+# (sem estados globais; resultados pequenos → baixo uso de RAM)
+# ============================================================
+
+from __future__ import annotations
 import numpy as np
+import pandas as pd
 
-def calculate_weighted_proportions(df: pd.DataFrame, indicator: str, group_by: list):
-    """
-    Prevalência ponderada + erro padrão + IC95%, por grupos.
-    Assume indicador binário (0/1) e peso 'pesorake'.
-    """
-    if indicator not in df.columns or 'pesorake' not in df.columns:
-        return pd.DataFrame()
+DIM_COLS = ["ano", "cidade_nome", "sexo", "faixa_etaria", "faixa_escolaridade"]
 
-    data = df[group_by + [indicator, 'pesorake']].copy()
-    data[indicator] = pd.to_numeric(data[indicator], errors='coerce').fillna(0)
-    data['pesorake'] = pd.to_numeric(data['pesorake'], errors='coerce').fillna(0)
+def _apply_filters(df: pd.DataFrame,
+                   anos: list[int] | None = None,
+                   cidades: list[str] | None = None,
+                   sexos: list[str] | None = None,
+                   fet: list[str] | None = None,
+                   fesc: list[str] | None = None) -> pd.DataFrame:
+    out = df
+    if anos:
+        out = out[out["ano"].isin(anos)]
+    if cidades and "cidade_nome" in out:
+        out = out[out["cidade_nome"].isin(cidades)]
+    if sexos and "sexo" in out:
+        out = out[out["sexo"].isin(sexos)]
+    if fet and "faixa_etaria" in out:
+        out = out[out["faixa_etaria"].isin(fet)]
+    if fesc and "faixa_escolaridade" in out:
+        out = out[out["faixa_escolaridade"].isin(fesc)]
+    return out
 
-    results = []
-    for name, g in data.groupby(group_by, dropna=False):
-        n = len(g)
-        w_sum = g['pesorake'].sum()
-        if w_sum <= 0:
-            continue
+def series_evolucao(df: pd.DataFrame, indicador: str, cidades: list[str], anos: list[int] | None = None) -> pd.DataFrame:
+    # Linha: ano x cidade (prevalência média simples dos filtros remanescentes)
+    cols = ["ano", "cidade_nome", indicador]
+    subset = _apply_filters(df, anos=anos, cidades=cidades)[cols].dropna(subset=[indicador])
+    if subset.empty:
+        return subset
+    res = (subset
+           .groupby(["ano", "cidade_nome"], as_index=False, sort=True)[indicador]
+           .mean())  # já está agregado no cubo; média simples sobre estratos filtrados
+    return res
 
-        prev = (g[indicator] * g['pesorake']).sum() / w_sum
-        # Var ≈ ( Σ w_i^2 * (y_i - p)^2 ) / (Σ w_i)^2
-        variance = np.sum((g['pesorake'] ** 2) * (g[indicator] - prev) ** 2) / (w_sum ** 2)
-        se = float(np.sqrt(variance))
-        z = 1.96
-        lower = max(0.0, prev - z * se)
-        upper = min(1.0, prev + z * se)
+def barras_categoria(df: pd.DataFrame, indicador: str, dim: str,
+                     ano: int, cidade: str) -> pd.DataFrame:
+    # Barras: uma dimensão categórica (sexo/fet/fesc)
+    if dim not in DIM_COLS:
+        raise ValueError(f"Dimensão inválida: {dim}")
+    cols = [dim, indicador]
+    sub = _apply_filters(df, anos=[ano], cidades=[cidade])[cols].dropna(subset=[indicador])
+    if sub.empty:
+        return sub
+    res = sub.groupby(dim, as_index=False)[indicador].mean()
+    return res
 
-        if isinstance(name, tuple):
-            row = dict(zip(group_by, name))
-        else:
-            row = {group_by[0]: name}
-        row.update({
-            'n': n,
-            'prevalencia': float(prev),
-            'erro_padrao': se,
-            'ic_inferior': float(lower),
-            'ic_superior': float(upper),
-        })
-        results.append(row)
+def ranking_capitais(df: pd.DataFrame, indicador: str, ano: int, top_k: int = 10) -> pd.DataFrame:
+    # Ranking simples por capital no ano
+    cols = ["cidade_nome", indicador]
+    sub = _apply_filters(df, anos=[ano])[cols].dropna(subset=[indicador])
+    if sub.empty:
+        return sub
+    res = sub.groupby("cidade_nome", as_index=False)[indicador].mean()
+    res = res.sort_values(indicador, ascending=False, kind="mergesort")
+    return res.head(top_k)
 
-    return pd.DataFrame(results)
+def ultimo_ano_disponivel(df: pd.DataFrame) -> int:
+    return int(df["ano"].max())
+
+def primeiras_cidades(df: pd.DataFrame, n: int = 6) -> list[str]:
+    # escolhe as N mais frequentes (estáveis pra vitrine)
+    if "cidade_nome" not in df.columns:
+        return []
+    freq = df["cidade_nome"].value_counts()
+    return freq.head(n).index.tolist()
