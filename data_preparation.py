@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 # Onde ficam os arquivos do cubo
-CUBO_DIR = Path("outputs/bi")
+CUBO_DIR = Path("outputs")
 
 # Ordem preferida de leitura (mais leve -> mais pesado)
 WIDE_FIRST = [
@@ -123,3 +123,4 @@ def load_cubo() -> tuple[pd.DataFrame, dict]:
         "faixa_escolaridade": fesc,
     }
     return df, META
+
